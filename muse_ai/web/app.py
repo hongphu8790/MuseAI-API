@@ -17,12 +17,16 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from .chat_media import ChatMediaManager, media_references
+from .chat_store import ChatStore, parse_muse_history
+from .chat_uploads import stage_chat_files
 from .account_pool import AccountPool
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from ..auth import MuseAuth
 from ..client import MuseClient
+from ..errors import MuseVideoNotCreated
+from ..text import terminal_video_task_ids
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = PACKAGE_DIR / "static"
@@ -57,6 +61,14 @@ class ChatSendRequest(BaseModel):
     account_id: str | None = None
     session_id: str | None = None
     timeout: float = 120.0
+    thread_id: str | None = None
+
+
+class ChatThreadSaveRequest(BaseModel):
+    accountId: str
+    sessionId: str | None = None
+    name: str = "Cuộc hội thoại"
+    messages: list[dict[str, Any]] = []
 
 
 class AccountOtpRequest(BaseModel):
@@ -65,6 +77,10 @@ class AccountOtpRequest(BaseModel):
 
 class AccountEnabledRequest(BaseModel):
     enabled: bool
+
+
+class AccountProxyRequest(BaseModel):
+    proxy_url: str | None = None
 
 
 @dataclass(slots=True)
@@ -87,6 +103,8 @@ class JobRecord:
     downloads: list[str] = field(default_factory=list)
     download_errors: list[str] = field(default_factory=list)
     error: str | None = None
+    error_code: str | None = None
+    muse_text: str | None = None
 
     def public(self) -> dict[str, Any]:
         data = asdict(self)
@@ -167,7 +185,9 @@ class WebService:
         self._legacy_pending_account_id: str | None = None
         self._chat_clients: dict[str, MuseClient] = {}
         self._chat_locks: dict[str, asyncio.Lock] = {}
+        self._chat_reconcile_tasks: dict[str, asyncio.Task] = {}
         self.chat_media = ChatMediaManager(WEB_STATE_DIR / "chat-media")
+        self.chat_store = ChatStore(WEB_STATE_DIR / "chat-history.sqlite3")
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
     async def auth_status(self) -> dict[str, Any]:
@@ -208,6 +228,7 @@ class WebService:
         session_id: str | None,
         timeout: float,
         account_id: str | None = None,
+        attachments: list[dict] | None = None,
     ) -> dict[str, Any]:
         ready = [a for a in self.accounts.list() if a["enabled"] and a["status"] == "ready"]
         if account_id is None:
@@ -236,6 +257,7 @@ class WebService:
 
             try:
                 baseline: set[str] = set()
+                baseline_terminal: set[str] = set()
                 if session_id is not None:
                     try:
                         before = await client.history(session_id=session_id, limit=80)
@@ -243,12 +265,17 @@ class WebService:
                             f"{kind}:{ref.identity}"
                             for kind, ref in media_references(before)
                         }
+                        baseline_terminal = terminal_video_task_ids(before)
                     except Exception:
                         pass
 
-                result = await client.send_text(
-                    prompt=message, session_id=session_id, timeout=timeout
-                )
+                send_options = {
+                    "prompt": message, "session_id": session_id,
+                    "timeout": timeout,
+                }
+                if attachments:
+                    send_options["attachments"] = attachments
+                result = await client.send_text(**send_options)
                 media_expected = any(
                     word in message.casefold()
                     for word in (
@@ -267,13 +294,33 @@ class WebService:
                         download=lambda kind, ref, target: self._download_chat_media(
                             account_id, kind, ref, target
                         ),
-                        timeout=300 if media_expected else 20,
+                        timeout=300 if media_expected else 120,
+                        response_text=result.text,
+                        expected_kind="video" if any(
+                            term in message.casefold()
+                            for term in ("video", "clip", "phim")
+                        ) else None,
+                        baseline_terminal=baseline_terminal,
+                    )
+                response_note = None
+                content_lower = result.text.casefold()
+                if any(phrase in content_lower for phrase in (
+                    "bị chặn ở khu vực", "không khả dụng ở khu vực",
+                    "not available in your region", "region is not supported",
+                )):
+                    response_note = (
+                        "Muse có nhắc tới giới hạn khu vực, nhưng đây chỉ là nội dung "
+                        "chat, không xác nhận task tạo video thất bại. "
+                        "Hãy kiểm tra trạng thái job và video thực tế."
                     )
                 return {
                     "ok": True,
                     "account_id": account_id,
                     "session_id": result.session_id,
                     "text": result.text,
+                    "reply_finished": getattr(result, "finished", False),
+                    "completion_source": getattr(result, "completion_source", "unknown"),
+                    "warning": response_note,
                     "media_job_id": media_job.id if media_job else None,
                     "media_expected": media_expected,
                     "attachments": [],
@@ -288,6 +335,68 @@ class WebService:
             if client is None:
                 raise RuntimeError("Muse chat connection has closed")
             return await client.history(session_id=session_id, limit=80)
+
+    def schedule_chat_reconcile(self, thread_id: str) -> None:
+        previous = self._chat_reconcile_tasks.pop(thread_id, None)
+        if previous is not None and not previous.done():
+            previous.cancel()
+
+        async def reconcile():
+            # Catch late stream chunks even if the browser tab is closed.
+            for delay in (20, 40):
+                await asyncio.sleep(delay)
+                try:
+                    await self.sync_muse_thread(thread_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Best-effort only; manual Sync button remains available.
+                    pass
+
+        task = asyncio.create_task(reconcile(), name=f"muse-chat-sync-{thread_id}")
+        self._chat_reconcile_tasks[thread_id] = task
+        task.add_done_callback(
+            lambda finished: self._chat_reconcile_tasks.pop(thread_id, None)
+            if self._chat_reconcile_tasks.get(thread_id) is finished else None
+        )
+
+    async def sync_muse_thread(self, thread_id: str) -> dict[str, Any]:
+        thread = self.chat_store.get(thread_id)
+        if thread is None:
+            raise KeyError("Conversation not found in SQLite")
+        account_id = thread["accountId"]
+        session_id = thread["sessionId"]
+        if not session_id:
+            raise ValueError("Conversation has no Muse session_id")
+        record = self.accounts.get(account_id)
+        if not record.enabled or record.status != "ready":
+            raise ValueError("Select a ready Muse account before synchronizing")
+        if self.accounts.is_busy(account_id):
+            raise ValueError("Muse account is currently generating video")
+
+        async with self.chat_lock(account_id):
+            client = self._chat_clients.get(account_id)
+            if client is None:
+                state = self.accounts.state_dir(account_id)
+                client = MuseClient(MuseAuth(state_dir=state), state_dir=state)
+                try:
+                    await client.connect()
+                except Exception:
+                    await client.close()
+                    raise
+                self._chat_clients[account_id] = client
+            # Muse history API may impose a lower effective limit. Do not
+            # replace local records just because the remote result is shorter.
+            raw = await client.history(session_id=session_id, limit=200)
+        remote_messages = parse_muse_history(raw)
+        if not remote_messages:
+            raise ValueError(
+                "Muse returned no recognizable messages; existing local history was kept"
+            )
+        merged = self.chat_store.put(
+            {**thread, "messages": remote_messages}, from_muse=True
+        )
+        return {"ok": True, "thread": merged, "remote_count": len(remote_messages)}
 
     async def _download_chat_media(
         self, account_id: str, kind: str, ref: Any, target: Path
@@ -357,12 +466,18 @@ class WebService:
                     }
                     for name in downloads
                 ]
-                status = "completed" if downloads else "completed_no_media"
-                message = (
-                    f"Hoàn tất: {len(downloads)} file đã tải về"
-                    if downloads
-                    else "Generation hoàn tất nhưng chưa tải được file media"
-                )
+                if downloads and result.download_errors:
+                    status = "completed_partial"
+                    message = (
+                        f"Đã tải {len(downloads)} video; "
+                        f"{len(result.download_errors)} mục media khác không khả dụng"
+                    )
+                elif downloads:
+                    status = "completed"
+                    message = f"Đã tải {len(downloads)} video"
+                else:
+                    status = "completed_no_media"
+                    message = "Muse đã tạo media nhưng chưa tải được video về máy"
                 await self.jobs.update(
                     job_id,
                     status=status,
@@ -381,6 +496,17 @@ class WebService:
                     finished_at=utc_now(),
                 )
                 raise
+            except MuseVideoNotCreated as exc:
+                await self.jobs.update(
+                    job_id,
+                    status="failed",
+                    message="Muse đã trả lời xong nhưng không tạo video",
+                    error=str(exc),
+                    error_code="muse_finished_without_video",
+                    muse_text=exc.muse_text,
+                    session_id=exc.session_id,
+                    finished_at=utc_now(),
+                )
             except Exception as exc:
                 await self.jobs.update(
                     job_id,
@@ -393,6 +519,11 @@ class WebService:
                 await client.close()
 
     async def shutdown(self) -> None:
+        reconcile_tasks = list(self._chat_reconcile_tasks.values())
+        for task in reconcile_tasks:
+            task.cancel()
+        await asyncio.gather(*reconcile_tasks, return_exceptions=True)
+        self._chat_reconcile_tasks.clear()
         await self.chat_media.close()
         for task in list(self.jobs.tasks.values()):
             if not task.done():
@@ -501,6 +632,17 @@ async def set_account_enabled(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@app.put("/api/accounts/{account_id}/proxy")
+async def configure_account_proxy(account_id: str, body: AccountProxyRequest) -> dict[str, Any]:
+    try:
+        await service.close_chat_client(account_id)
+        return await service.accounts.set_proxy(account_id, body.proxy_url)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Muse account not found") from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.delete("/api/accounts/{account_id}")
 async def remove_account(account_id: str) -> dict[str, Any]:
     try:
@@ -580,17 +722,169 @@ async def chat_send(body: ChatSendRequest) -> dict[str, Any]:
             detail="timeout must be between 5 and 900 seconds",
         )
 
+    thread = None
+    if body.thread_id:
+        thread = service.chat_store.get(body.thread_id)
+        if thread is None:
+            raise HTTPException(status_code=404, detail="Conversation not found in SQLite")
+        if thread["accountId"] != body.account_id:
+            raise HTTPException(status_code=400, detail="Wrong Muse account for conversation")
+        if thread["sessionId"] and body.session_id and thread["sessionId"] != body.session_id:
+            raise HTTPException(status_code=400, detail="Wrong Muse session for conversation")
+        # Save the user turn before asking Muse: browser disconnects must not lose it.
+        if not thread["messages"] or thread["messages"][-1].get("role") != "user" or (
+            thread["messages"][-1].get("text") != message
+        ):
+            thread["messages"].append({"role": "user", "text": message})
+        service.chat_store.put(thread)
     try:
-        return await service.send_chat_message(
+        result = await service.send_chat_message(
             message=message,
             account_id=body.account_id,
             session_id=body.session_id,
             timeout=body.timeout,
         )
+        if thread is not None:
+            latest = service.chat_store.get(thread["id"])
+            if latest is not None:
+                latest["sessionId"] = result["session_id"] or latest["sessionId"]
+                latest["messages"].append({"role": "assistant", "text": result["text"]})
+                service.chat_store.put(latest)
+                service.schedule_chat_reconcile(thread["id"])
+        return result
     except (ValueError, KeyError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/chat/send-files")
+async def chat_send_files(
+    message: str = Form(""),
+    account_id: str = Form(...),
+    session_id: str | None = Form(None),
+    thread_id: str = Form(...),
+    timeout: float = Form(120.0),
+    files: list[UploadFile] = File(...),
+) -> dict[str, Any]:
+    """Submit 1–10 attachments in one chat turn, preserving them locally."""
+    if not 5 <= timeout <= 900:
+        raise HTTPException(status_code=400, detail="timeout must be between 5 and 900 seconds")
+    thread = service.chat_store.get(thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Conversation not found in SQLite")
+    if thread["accountId"] != account_id:
+        raise HTTPException(status_code=400, detail="Wrong Muse account for conversation")
+    if thread["sessionId"] and session_id and thread["sessionId"] != session_id:
+        raise HTTPException(status_code=400, detail="Wrong Muse session for conversation")
+    if not message.strip() and not files:
+        raise HTTPException(status_code=400, detail="Message or attachments required")
+    user_text = message.strip() or "Hãy xem các tệp đính kèm."
+    try:
+        staged = await stage_chat_files(
+            files, WEB_STATE_DIR / "chat-uploads", thread_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    public_files = [
+        {
+            "id": item["id"], "name": item["name"],
+            "kind": item["kind"], "size": item["size"],
+            "url": f"/api/chat/uploads/{thread_id}/{item['id']}",
+        }
+        for item in staged
+    ]
+    latest = service.chat_store.get(thread_id) or thread
+    if latest["messages"] and latest["messages"][-1].get("role") == "user" and (
+        latest["messages"][-1].get("text") == user_text
+    ):
+        latest["messages"][-1]["uploads"] = public_files
+    else:
+        latest["messages"].append({
+            "role": "user", "text": user_text, "uploads": public_files,
+        })
+    service.chat_store.put(latest)
+    try:
+        result = await service.send_chat_message(
+            message=user_text, account_id=account_id,
+            session_id=session_id, timeout=timeout, attachments=staged,
+        )
+        updated = service.chat_store.get(thread_id)
+        if updated is not None:
+            updated["sessionId"] = result["session_id"] or updated["sessionId"]
+            updated["messages"].append({"role": "assistant", "text": result["text"]})
+            service.chat_store.put(updated)
+            service.schedule_chat_reconcile(thread_id)
+        return {**result, "uploaded_files": public_files}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Muse chưa xác nhận được yêu cầu với tệp đính kèm: " + str(exc),
+        ) from exc
+
+
+@app.get("/api/chat/uploads/{thread_id}/{file_id}")
+async def get_chat_upload(thread_id: str, file_id: str):
+    import re
+    if not re.fullmatch(r"[\w-]{1,128}", thread_id) or not re.fullmatch(r"[a-f0-9]{32}", file_id):
+        raise HTTPException(status_code=404, detail="File not found")
+    thread = service.chat_store.get(thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    visible = next(
+        (item for msg in thread["messages"] for item in msg.get("uploads", [])
+         if isinstance(item, dict) and item.get("id") == file_id),
+        None
+    )
+    if visible is None:
+        raise HTTPException(status_code=404, detail="File is not attached to this chat")
+    candidates = list((WEB_STATE_DIR / "chat-uploads" / thread_id).glob(file_id + ".*"))
+    if len(candidates) != 1 or not candidates[0].is_file():
+        raise HTTPException(status_code=404, detail="File not found on server")
+    return FileResponse(
+        candidates[0], filename=visible.get("name") or "file",
+        content_disposition_type="inline" if visible.get("kind") == "image" else "attachment",
+    )
+
+
+@app.get("/api/chat/threads")
+async def chat_threads(account_id: str | None = None) -> dict[str, Any]:
+    if account_id:
+        try:
+            service.accounts.get(account_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Muse account not found") from exc
+    return {"threads": service.chat_store.list(account_id)}
+
+
+@app.put("/api/chat/threads/{thread_id}")
+async def save_chat_thread(thread_id: str, body: ChatThreadSaveRequest) -> dict[str, Any]:
+    try:
+        service.accounts.get(body.accountId)
+        thread = service.chat_store.put({
+            "id": thread_id,
+            "accountId": body.accountId,
+            "sessionId": body.sessionId,
+            "name": body.name,
+            "messages": body.messages,
+        })
+        return {"ok": True, "thread": thread}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Muse account not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/chat/threads/{thread_id}/sync")
+async def sync_chat_thread(thread_id: str) -> dict[str, Any]:
+    try:
+        return await service.sync_muse_thread(thread_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Could not fetch Muse chat history") from exc
 
 
 @app.get("/api/chat/media/{media_id}")

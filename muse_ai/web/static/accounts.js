@@ -82,6 +82,11 @@
         actions.appendChild(button);
       };
       makeButton("Kiểm tra", "verify");
+      makeButton(account.proxy_enabled ? "Đổi proxy" : "+ Proxy", "proxy");
+      if (account.proxy_enabled) {
+        makeButton("Xóa proxy", "clear_proxy");
+        detail.textContent += " · Proxy: " + (account.proxy_label || "đã bật");
+      }
       if (account.email && account.status !== "ready") {
         makeButton("Gửi lại OTP", "resend");
       }
@@ -126,7 +131,21 @@
     msg.textContent = "";
     try {
       const url = "/api/accounts/" + encodeURIComponent(account.id);
-      if (action === "verify") {
+      if (action === "proxy" || action === "clear_proxy") {
+        let value = null;
+        if (action === "proxy") {
+          value = window.prompt(
+            "Proxy cho " + account.label + " (http://host:port hoặc socks5://host:port). Để trống để hủy:",
+            ""
+          );
+          if (!value || !value.trim()) return;
+        }
+        await api(url + "/proxy", {
+          method: "PUT",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({proxy_url: value})
+        });
+      } else if (action === "verify") {
         await api(url + "/verify", {method: "POST"});
       } else if (action === "resend") {
         await api(url + "/resend", {method: "POST"});

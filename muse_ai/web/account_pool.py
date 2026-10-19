@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ..auth import MuseAuth
+from .proxy_config import public_proxy, save_proxy
 
 
 def now() -> str:
@@ -95,8 +96,23 @@ class AccountPool:
         return account
 
     def list(self) -> list[dict[str, Any]]:
-        return [account.public(account.id in self._leases)
-                for account in self._accounts.values()]
+        return [
+            {**account.public(account.id in self._leases),
+             **public_proxy(self.state_dir(account.id))}
+            for account in self._accounts.values()
+        ]
+
+    async def set_proxy(self, account_id: str, proxy_url: str | None) -> dict[str, Any]:
+        async with self._lock:
+            record = self.get(account_id)
+            if self.is_busy(account_id):
+                raise RuntimeError("Không đổi proxy khi tài khoản đang chạy task.")
+            save_proxy(self.state_dir(account_id), proxy_url)
+            # A new verification will use the configured network route.
+            if record.status == "ready":
+                record.status = "stored"
+                self._persist()
+            return {**record.public(False), **public_proxy(self.state_dir(account_id))}
 
     def is_busy(self, account_id: str) -> bool:
         return account_id in self._leases

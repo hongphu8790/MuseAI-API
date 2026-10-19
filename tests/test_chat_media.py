@@ -132,5 +132,68 @@ async def test_monitor_ignores_previous_media(tmp_path):
         settle_seconds=0.01,
     )
     await manager.tasks[job.id]
-    assert job.status == "completed"
+    assert job.status == "reply_unconfirmed"
     assert job.files == []
+
+@pytest.mark.asyncio
+async def test_monitor_reports_finished_reply_without_video(tmp_path):
+    manager = ChatMediaManager(tmp_path / "chat-media")
+    reply = "Tôi không thể tạo video ở khu vực này."
+
+    async def fetch(_session):
+        return {"messages": [
+            {"role": "assistant", "content": reply, "finish_reason": "stop"}
+        ], "tasks": [{"id": "task-new", "kind": "video_generation", "status": "failed"}]}
+
+    async def download(*_args):
+        raise AssertionError("There is no video to download")
+
+    job = manager.start(
+        session_id="session-final",
+        baseline=set(),
+        fetch=fetch,
+        download=download,
+        response_text=reply,
+        expected_kind="video",
+        timeout=1,
+        poll_interval=0.001,
+    )
+    await manager.tasks[job.id]
+    assert job.status == "no_media"
+    assert job.error_code == "muse_finished_without_video"
+    assert job.muse_message == reply
+    assert reply in job.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_monitor_does_not_fail_while_video_task_running(tmp_path):
+    manager = ChatMediaManager(tmp_path / "chat-media")
+    reply = "Đang tạo video."
+    checks = 0
+
+    async def fetch(_session):
+        nonlocal checks
+        checks += 1
+        response = {"messages": [
+            {"role": "assistant", "content": reply, "finish_reason": "stop"}
+        ], "tasks": [{"kind": "video_generation",
+                      "status": "running" if checks <= 2 else "completed"}]}
+        if checks >= 3:
+            response["media"] = {"kind": "video", "path": "workspace/final.mp4"}
+        return response
+
+    async def download(_kind, _ref, target):
+        target.write_bytes(b"fake-video")
+        return target
+
+    job = manager.start(
+        session_id="session-pending", baseline=set(),
+        fetch=fetch, download=download, response_text=reply,
+        expected_kind="video", timeout=1, poll_interval=0.001,
+        settle_seconds=0.001,
+    )
+    await manager.tasks[job.id]
+    assert checks >= 3
+    assert job.status == "completed"
+    assert len(job.files) == 1
+    assert job.error_code is None

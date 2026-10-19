@@ -44,8 +44,13 @@ class MuseBootstrap:
 class MuseAuth:
     BASE = "https://muse.ai"
 
-    def __init__(self, *, state_dir: str | Path = ".muse-state", timeout: float = 30.0) -> None:
+    def __init__(self, *, state_dir: str | Path = ".muse-state", timeout: float = 30.0, proxy: str | None = None) -> None:
         self.state_dir = Path(state_dir)
+        if proxy is None:
+            config = self.state_dir / "proxy.json"
+            if config.is_file():
+                proxy = json.loads(config.read_text(encoding="utf-8")).get("url")
+        self.proxy = proxy
         self.cookie_path = self.state_dir / "cookies.json"
         self.waterfall_id: str | None = None
         self.csrf_token: str | None = None
@@ -53,11 +58,13 @@ class MuseAuth:
         self.browser = BrowserAsyncSession(
             impersonate="chrome",
             timeout=timeout,
+            proxies={"http": proxy, "https": proxy} if proxy else None,
             headers={
                 "Accept-Language": "vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5",
             },
         )
         self.http = httpx.AsyncClient(
+            proxy=proxy,
             base_url=self.BASE,
             follow_redirects=True,
             timeout=timeout,

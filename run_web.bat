@@ -6,4 +6,4 @@ if not exist ".venv\Scripts\python.exe" (
   exit /b 1
 )
 call .venv\Scripts\activate.bat
-muse-web --host 127.0.0.1 --port 8787
+muse-web --host 127.0.0.1 --port 8788

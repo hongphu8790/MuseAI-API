@@ -49,6 +49,16 @@
   font: inherit;
   font-size: 13px;
 }
+.chat-sync-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 9px;
+  flex-wrap: wrap;
+  align-items: stretch;
+}
+.chat-sync-row input { flex: 1 1 225px; min-width: 0; margin: 0; }
+.chat-sync-row button { white-space: normal; }
+#chatSyncNotice { margin: 6px 0 0; overflow-wrap: anywhere; }
 .chat-messages {
   margin-top: 15px;
   height: 380px;
@@ -126,6 +136,13 @@
 .chat-media-status, .chat-media-warning { font-size: 12px; margin: 10px 0 0; }
 .chat-media-status { color: #93c5fd; }
 .chat-media-warning { color: #fda4af; }
+.chat-selected-files { display: flex; flex-wrap: wrap; gap: 7px; padding: 7px 0; }
+.chat-file-chip { display: inline-flex; align-items: center; gap: 7px; max-width: 100%;
+  padding: 6px 9px; border: 1px solid var(--line); border-radius: 9px;
+  color: var(--text); font-size: 12px; overflow-wrap: anywhere; }
+.chat-file-chip button { font: inherit; color: #fca5a5; background: transparent; border: 0; cursor: pointer; }
+.chat-file-button { display: inline-flex; cursor: pointer; align-items: center; border: 1px solid var(--line);
+  padding: 8px 12px; border-radius: 10px; white-space: nowrap; }
 .chat-compose { margin-top: 12px; }
 .chat-compose textarea {
   min-height: 86px;

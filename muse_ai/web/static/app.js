@@ -313,8 +313,10 @@ function statusLabel(status) {
     generating: "Đang tạo",
     downloading: "Đang tải",
     completed: "Hoàn tất",
-    completed_no_media: "Hoàn tất",
+    completed_partial: "Có video",
+    completed_no_media: "Chưa có file",
     failed: "Lỗi",
+    no_media: "Không có tệp",
     cancelled: "Đã hủy",
     interrupted: "Gián đoạn"
   };
@@ -322,7 +324,18 @@ function statusLabel(status) {
 }
 
 function renderJobs(jobs) {
-  jobsEl.innerHTML = "";
+  const previousCards = Array.from(jobsEl.querySelectorAll(".job-card"));
+  const oldById = new Map(previousCards.map(card => [card.dataset.jobId, card]));
+  const expanded = new Map(
+    previousCards.map(card => [
+      card.dataset.jobId,
+      {
+        results: Boolean(card.querySelector(".job-results")?.open),
+        diagnostic: Boolean(card.querySelector(".job-diagnostics")?.open),
+        prompt: Boolean(card.querySelector(".job-prompt-details")?.open)
+      }
+    ])
+  );
   const running = jobs.find((job) =>
     ["queued", "connecting", "generating", "downloading"].includes(job.status)
   );
@@ -347,9 +360,29 @@ function renderJobs(jobs) {
   }
 
   const template = byId("jobTemplate");
+  if (!previousCards.length) jobsEl.replaceChildren();
+  const currentIds = new Set(jobs.map(job => job.id));
 
   jobs.forEach((job) => {
+    const signature = JSON.stringify([
+      job.status, job.message, job.download_urls,
+      job.download_errors, job.error, job.videos
+    ]);
+    const previous = oldById.get(job.id);
+    if (previous && previous.dataset.signature === signature) {
+      // Keep live <video> elements intact while unrelated jobs update.
+      return;
+    }
     const node = template.content.cloneNode(true);
+    const card = node.querySelector(".job-card");
+    card.dataset.jobId = job.id;
+    card.dataset.signature = signature;
+    const saved = expanded.get(job.id);
+    if (saved) {
+      node.querySelector(".job-results").open = saved.results;
+      node.querySelector(".job-diagnostics").open = saved.diagnostic;
+      node.querySelector(".job-prompt-details").open = saved.prompt;
+    }
     node.querySelector(".job-id").textContent = "#" + job.id;
     node.querySelector(".job-time").textContent =
       new Date(job.created_at).toLocaleString();
@@ -359,7 +392,12 @@ function renderJobs(jobs) {
     status.classList.add(job.status);
 
     node.querySelector(".job-prompt").textContent = job.prompt;
-    node.querySelector(".job-message").textContent = job.message || "";
+    node.querySelector(".job-full-prompt").textContent = job.prompt;
+    node.querySelector(".job-message").textContent =
+      job.error_code === "muse_finished_without_video"
+        ? (job.message || "Muse không tạo video") +
+          " — Phản hồi Muse: " + (job.muse_text || job.error || "Không có nội dung")
+        : (job.message || "");
 
     const meta = node.querySelector(".job-meta");
     const entries = [
@@ -381,7 +419,14 @@ function renderJobs(jobs) {
     });
 
     const videos = node.querySelector(".videos");
-    (job.download_urls || []).forEach((url, index) => {
+    const urls = Array.isArray(job.download_urls) ? job.download_urls : [];
+    if (urls.length) {
+      const results = node.querySelector(".job-results");
+      results.classList.remove("hidden");
+      results.querySelector(".job-results-summary").textContent =
+        "▶ Xem / tải " + urls.length + " video";
+    }
+    urls.forEach((url, index) => {
       const wrap = document.createElement("div");
       wrap.className = "video-wrap";
 
@@ -413,11 +458,22 @@ function renderJobs(jobs) {
       errors.push(job.error);
     }
     if (errors.length) {
+      const diagnostic = node.querySelector(".job-diagnostics");
+      diagnostic.classList.remove("hidden");
+      diagnostic.querySelector("summary").textContent =
+        "Chi tiết " + errors.length + " lỗi tải tệp";
       node.querySelector(".job-error").textContent = errors.join("\n");
     }
 
-    jobsEl.appendChild(node);
+    if (previous) {
+      previous.replaceWith(card);
+    } else {
+      jobsEl.appendChild(node);
+    }
   });
+  for (const previous of previousCards) {
+    if (!currentIds.has(previous.dataset.jobId)) previous.remove();
+  }
 }
 
 async function refreshJobs() {

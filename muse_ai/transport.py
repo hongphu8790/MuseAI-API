@@ -122,9 +122,12 @@ class HatchConnection:
         *,
         locale: str = "en-US",
         timeout: float = 15.0,
+        proxy: str | None = None,
     ) -> "HatchConnection":
+        # websockets>=15 supports an explicit per-connection HTTP/SOCKS proxy.
         ws = await websockets.connect(
             ws_url,
+            proxy=proxy if proxy else None,
             max_size=None,
             open_timeout=timeout,
             ping_interval=20,

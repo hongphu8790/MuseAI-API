@@ -53,6 +53,9 @@ def test_web_index_is_served():
         assert 'id="taskCount"' in response.text
         assert 'src="/accounts.js"' in response.text
         assert 'href="/accounts.css"' in response.text
+        assert 'href="/jobs-compact.css"' in response.text
+        assert '<details class="job-results hidden">' in response.text
+        assert '<details class="job-diagnostics hidden">' in response.text
         assert client.get("/accounts.js").status_code == 200
         assert client.get("/accounts.css").status_code == 200
 

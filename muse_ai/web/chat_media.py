@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from ..media import ImageRef, VideoRef, extract_image_refs, extract_video_refs
+from ..text import (
+    assistant_response_finished, latest_assistant_text,
+    muse_video_task_pending, muse_video_task_terminal,
+    terminal_video_task_ids,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +88,9 @@ class ChatMediaJob:
     status: str = "watching"
     files: list[dict[str, str]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    error_code: str | None = None
+    muse_message: str | None = None
+    reply_finished: bool = False
 
     def public(self) -> dict[str, Any]:
         return {
@@ -90,6 +98,9 @@ class ChatMediaJob:
             "status": self.status,
             "files": self.files,
             "errors": self.errors,
+            "error_code": self.error_code,
+            "muse_message": self.muse_message,
+            "reply_finished": self.reply_finished,
         }
 
 
@@ -110,6 +121,9 @@ class ChatMediaManager:
                     session_id=data["session_id"],
                     files=data.get("files", []),
                     errors=data.get("errors", []),
+                    error_code=data.get("error_code"),
+                    muse_message=data.get("muse_message"),
+                    reply_finished=bool(data.get("reply_finished")),
                     status="interrupted" if data.get("status") == "watching" else data.get("status", "completed"),
                 )
                 self.jobs[job.id] = job
@@ -144,13 +158,19 @@ class ChatMediaManager:
         timeout: float = 300,
         poll_interval: float = 3,
         settle_seconds: float = 12,
+        response_text: str = "",
+        expected_kind: str | None = None,
+        baseline_terminal: set[str] | None = None,
     ) -> ChatMediaJob:
         media_id = uuid.uuid4().hex[:16]
         job = ChatMediaJob(id=media_id, session_id=session_id)
         self.jobs[media_id] = job
         self.persist(job)
         task = asyncio.create_task(
-            self._run(job, baseline, fetch, download, timeout, poll_interval, settle_seconds),
+            self._run(
+                job, baseline, fetch, download, timeout, poll_interval,
+                settle_seconds, response_text, expected_kind, baseline_terminal or set(),
+            ),
             name=f"muse-chat-media-{media_id}",
         )
         self.tasks[media_id] = task
@@ -162,10 +182,13 @@ class ChatMediaManager:
         fetch: Callable[[str], Awaitable[Any]],
         download: Callable[[str, ImageRef | VideoRef | FileRef, Path], Awaitable[Path]],
         timeout: float, poll_interval: float, settle_seconds: float,
+        response_text: str, expected_kind: str | None,
+        baseline_terminal: set[str],
     ) -> None:
         seen = set(baseline)
         retries: dict[str, int] = {}
         first_file_time: float | None = None
+        final_without_media_polls = 0
         deadline = time.monotonic() + timeout
         async with self._semaphore:
             try:
@@ -223,11 +246,76 @@ class ChatMediaManager:
                                 job.errors.append(f"Không tải được tệp {kind} #{index+1} từ Muse.")
                                 self.persist(job)
 
+                    has_expected_media = (
+                        any(f["kind"] == expected_kind for f in job.files)
+                        if expected_kind else bool(job.files)
+                    )
+                    latest_text = latest_assistant_text(history)
+                    same_response = (
+                        bool(response_text)
+                        and bool(latest_text)
+                        and (latest_text.startswith(response_text)
+                             or response_text.startswith(latest_text))
+                    )
+                    if same_response:
+                        job.muse_message = max(
+                            job.muse_message or response_text, latest_text, key=len
+                        )
+                        job.reply_finished = assistant_response_finished(history)
+                        self.persist(job)
+                    if (
+                        expected_kind == "video"
+                        and not has_expected_media
+                        and same_response
+                        and assistant_response_finished(history)
+                        and bool(terminal_video_task_ids(history) - baseline_terminal)
+                        and not muse_video_task_pending(history)
+                        and not any(kind == "video" and
+                                    f"video:{ref.identity}" not in baseline
+                                    for kind, ref in media_references(history))
+                    ):
+                        final_without_media_polls += 1
+                        if final_without_media_polls >= 2:
+                            job.status = "no_media"
+                            job.error_code = "muse_finished_without_video"
+                            job.muse_message = latest_text
+                            job.errors.append(
+                                "Muse đã trả lời xong nhưng không có video. "
+                                "Phản hồi Muse: " + latest_text
+                            )
+                            break
+                    else:
+                        final_without_media_polls = 0
+
                     if first_file_time is not None and time.monotonic() - first_file_time >= settle_seconds:
+                        break
+                    if expected_kind is None and same_response and job.reply_finished:
+                        # A normal chat response with no requested video is
+                        # successful once Muse confirms its final message.
                         break
                     await asyncio.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
 
-                job.status = "completed"
+                if job.status == "no_media":
+                    pass
+                elif expected_kind == "video" and not any(
+                    f["kind"] == "video" for f in job.files
+                ):
+                    job.status = "failed" if job.errors else "no_media"
+                    if not job.errors:
+                        job.errors.append("Hết thời gian theo dõi nhưng Muse chưa cung cấp video.")
+                elif job.files or (expected_kind is None and job.reply_finished):
+                    job.status = "completed"
+                elif job.errors:
+                    job.status = "failed"
+                elif expected_kind is None:
+                    job.status = "reply_unconfirmed"
+                    job.errors.append(
+                        "Chưa xác minh được tín hiệu hoàn tất của Muse; "
+                        "có thể đồng bộ lại lịch sử theo session_id."
+                    )
+                else:
+                    job.status = "no_media"
+                    job.errors.append("Muse chưa trả về tệp nào trong thời gian theo dõi.")
             except asyncio.CancelledError:
                 job.status = "interrupted"
                 raise

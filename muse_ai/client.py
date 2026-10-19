@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from .attachments import build_items
 from .auth import MuseAuth
 from .filesystem import MuseFilesystem
+from .errors import MuseVideoNotCreated
 from .media import (
     ImageRef,
     VideoRef,
@@ -21,6 +22,11 @@ from .media import (
 from .routes import CHAT_CAPABILITIES
 from .text import (
     coalesce_text_fragments,
+    assistant_response_finished,
+    muse_video_task_pending,
+    muse_video_task_terminal,
+    terminal_video_task_ids,
+    latest_assistant_text,
     extract_assistant_texts,
     extract_text_fragments,
 )
@@ -43,6 +49,8 @@ class TextResult:
     text: str
     stream_events: list[dict] = field(default_factory=list)
     history: dict | list | None = None
+    finished: bool = False
+    completion_source: str = "unknown"
 
 
 @dataclass(slots=True)
@@ -83,6 +91,7 @@ class MuseClient:
         self.conn = await HatchConnection.connect(
             bootstrap.websocket_url(),
             locale=bootstrap.locale,
+            proxy=getattr(self.auth, "proxy", None),
         )
         self.fs = MuseFilesystem(self.conn)
 
@@ -154,6 +163,15 @@ class MuseClient:
         }
         if session_id:
             payload["session_id"] = session_id
+        # Noise's assembled stream payload must stay below its size budget.
+        inline_bytes = sum(
+            len(item.get("data_base64", ""))
+            for item in payload["items"] if item.get("type") == "image"
+        )
+        if inline_bytes > 12 * 1024 * 1024:
+            raise ValueError(
+                "Tổng dung lượng ảnh đính kèm sau xử lý quá lớn (giới hạn 12 MB mã hóa)."
+            )
 
         events: list[dict] = []
         try:
@@ -178,8 +196,14 @@ class MuseClient:
         session_id: str | None = None,
         timeout: float = 120.0,
         poll_interval: float = 1.5,
+        settle_seconds: float = 8.0,
+        attachments: list[dict] | None = None,
     ) -> TextResult:
-        """Send a text prompt to Muse and return the assistant response."""
+        """Send text and wait for Muse's response to stop changing.
+
+        History may expose a partial assistant message while Muse is still
+        generating it, so the first non-empty history result is not final.
+        """
 
         prompt = prompt.strip()
         if not prompt:
@@ -208,12 +232,37 @@ class MuseClient:
         except Exception:
             pass
 
+        incoming = attachments or []
+        images = [Path(item["path"]) for item in incoming if item["kind"] == "image"]
+        references = []
+        for item in incoming:
+            if item["kind"] != "document":
+                continue
+            # Muse's captured web image payload format is known; document
+            # attachment items are not. Upload docs to Muse workspace via its
+            # fs API and describe the paths rather than guessing a binary schema.
+            remote = (
+                "workspace/.muse_chat_uploads/"
+                + uuid.uuid4().hex + "/" + Path(item["name"]).name
+            )
+            uploaded = await self._fs().upload_file(item["path"], remote)
+            references.append(f"- {item['name']}: {uploaded}")
+        wire_prompt = prompt
+        if references:
+            wire_prompt += (
+                "\n\nCác tài liệu đã tải lên workspace Muse. Hãy sử dụng chúng "
+                "khi trả lời nếu có khả năng truy cập:\n" +
+                "\n".join(references)
+            )
         remaining = max(1.0, deadline - time.monotonic())
-        events = await self.chat_stream(
-            prompt=prompt,
-            session_id=target_session_id,
-            stream_timeout=min(30.0, remaining),
-        )
+        stream_options = {
+            "prompt": wire_prompt,
+            "session_id": target_session_id,
+            "stream_timeout": min(30.0, remaining),
+        }
+        if images:
+            stream_options["images"] = images
+        events = await self.chat_stream(**stream_options)
 
         event_sessions = extract_session_ids(events)
         if event_sessions and target_session_id not in event_sessions:
@@ -236,6 +285,8 @@ class MuseClient:
             ]
 
         latest_history = baseline_history
+        latest_response: str | None = None
+        response_changed_at: float | None = None
 
         while time.monotonic() < deadline:
             try:
@@ -250,12 +301,34 @@ class MuseClient:
                     and text.strip() != prompt
                 ]
                 if assistant_texts:
-                    return TextResult(
-                        session_id=resolved_session,
-                        text=assistant_texts[-1],
-                        stream_events=events,
-                        history=latest_history,
-                    )
+                    response = assistant_texts[-1]
+                    if response != latest_response:
+                        latest_response = response
+                        response_changed_at = time.monotonic()
+                    if assistant_response_finished(latest_history):
+                        return TextResult(
+                            session_id=resolved_session,
+                            text=response,
+                            stream_events=events,
+                            history=latest_history,
+                            finished=True,
+                            completion_source="muse_final",
+                        )
+                    # Quiet text does NOT mean Muse has completed its reply.
+                    # Return a provisional result; the media watcher can
+                    # continue polling and must not call it a final refusal.
+                    if settle_seconds <= 0 or (
+                        response_changed_at is not None
+                        and time.monotonic() - response_changed_at >= settle_seconds
+                    ):
+                        return TextResult(
+                            session_id=resolved_session,
+                            text=response,
+                            stream_events=events,
+                            history=latest_history,
+                            finished=False,
+                            completion_source="idle_fallback",
+                        )
             except Exception:
                 # A valid stream response remains usable if history is
                 # temporarily unavailable.
@@ -266,6 +339,16 @@ class MuseClient:
                     poll_interval,
                     max(0.05, deadline - time.monotonic()),
                 )
+            )
+
+        # A slow Muse response may still be changing at our deadline.
+        # Return the newest observed snapshot rather than the first fragment.
+        if latest_response:
+            return TextResult(
+                session_id=resolved_session,
+                text=latest_response,
+                stream_events=events,
+                history=latest_history,
             )
 
         stream_text = coalesce_text_fragments(event_fragments)
@@ -318,11 +401,14 @@ class MuseClient:
         poll_interval: float = 3.0,
         settle_seconds: float = 5.0,
         min_videos: int = 1,
+        baseline_assistant: set[str] | None = None,
+        baseline_terminal: set[str] | None = None,
     ) -> tuple[list[VideoRef], dict | list | None]:
         deadline = time.monotonic() + timeout
         first_found_at: float | None = None
         latest_history = None
         latest_refs: list[VideoRef] = []
+        final_without_video_polls = 0
 
         while time.monotonic() < deadline:
             latest_history = await self.history(session_id=session_id, limit=80)
@@ -340,6 +426,30 @@ class MuseClient:
                     return latest_refs, latest_history
             else:
                 first_found_at = None
+
+            # The last assistant response has to be both NEW and explicitly
+            # finished. A background video task with a pending/running status
+            # takes precedence over a finalized assistant chat message.
+            final_text = latest_assistant_text(latest_history)
+            new_reply = (
+                bool(final_text)
+                and final_text not in (baseline_assistant or set())
+            )
+            if (
+                not latest_refs
+                and new_reply
+                and assistant_response_finished(latest_history)
+                and bool(
+                    terminal_video_task_ids(latest_history) - (baseline_terminal or set())
+                )
+                and not muse_video_task_pending(latest_history)
+            ):
+                final_without_video_polls += 1
+                if final_without_video_polls >= 2:
+                    raise MuseVideoNotCreated(final_text, session_id=session_id)
+            else:
+                final_without_video_polls = 0
+
             await asyncio.sleep(poll_interval)
 
         if latest_refs:
@@ -449,6 +559,8 @@ class MuseClient:
 
         baseline_history = await self.history(session_id=session_id, limit=80)
         baseline = {ref.identity for ref in extract_video_refs(baseline_history)}
+        baseline_assistant = set(extract_assistant_texts(baseline_history))
+        baseline_terminal = terminal_video_task_ids(baseline_history)
 
         events = await self.chat_stream(
             prompt=prompt,
@@ -464,6 +576,8 @@ class MuseClient:
             baseline=baseline,
             timeout=timeout,
             min_videos=min_videos,
+            baseline_assistant=baseline_assistant,
+            baseline_terminal=baseline_terminal,
         )
 
         downloaded: list[Path] = []
@@ -487,6 +601,18 @@ class MuseClient:
                         await self.download_video(ref, out / filename)
                     )
                 except Exception as exc:
+                    # Media presentations sometimes arrive before their
+                    # backing /fs/raw objects. Retry one 404 before recording
+                    # the failed ref; other videos may already be available.
+                    if "not_found" in str(exc) or "HTTP 404" in str(exc):
+                        await asyncio.sleep(2.0)
+                        try:
+                            downloaded.append(
+                                await self.download_video(ref, out / filename)
+                            )
+                            continue
+                        except Exception as retry_exc:
+                            exc = retry_exc
                     download_errors.append(
                         f"video[{index + 1}] {ref.identity}: {exc}"
                     )

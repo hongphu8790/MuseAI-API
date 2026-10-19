@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="/chat.css">
   <link rel="stylesheet" href="/auth-modal.css">
   <link rel="stylesheet" href="/accounts.css">
+  <link rel="stylesheet" href="/jobs-compact.css">
 </head>
 <body>
   <div class="noise"></div>
@@ -83,8 +84,14 @@
           </div>
           <label class="chat-history-label" for="chatAccount">Sử dụng tài khoản Muse</label>
           <select id="chatAccount" class="chat-thread-select" aria-label="Chọn tài khoản Muse để chat"></select>
-          <label class="chat-history-label" for="chatThreads">Cuộc hội thoại đã lưu trên trình duyệt</label>
+          <label class="chat-history-label" for="chatThreads">Lịch sử hội thoại (lưu trên máy chủ SQLite)</label>
           <select id="chatThreads" class="chat-thread-select" aria-label="Chọn cuộc hội thoại"></select>
+          <div class="chat-sync-row">
+            <input id="syncSessionId" type="text" autocomplete="off"
+                   placeholder="session_id (để trống nếu hội thoại đã có)" aria-label="Muse session ID để đồng bộ">
+            <button id="syncChat" class="ghost" type="button">↻ Đồng bộ lịch sử từ Muse</button>
+          </div>
+          <div id="chatSyncNotice" class="muted small" role="status" aria-live="polite"></div>
 
           <div id="chatMessages" class="chat-messages">
             <div class="chat-empty">
@@ -95,8 +102,13 @@
 
           <div class="chat-compose">
             <textarea id="chatInput" rows="4" placeholder="Nhập tin nhắn..."></textarea>
+            <div id="chatSelectedFiles" class="chat-selected-files" aria-live="polite"></div>
             <div class="chat-compose-row">
-              <span class="muted small">Enter để gửi · Shift+Enter xuống dòng</span>
+              <label class="ghost chat-file-button" for="chatFileInput">＋ Đính kèm tệp
+                <input id="chatFileInput" type="file" multiple hidden
+                  accept=".png,.jpg,.jpeg,.webp,.gif,.pdf,.txt,.md,.csv,.json,.docx,.xlsx,.pptx">
+              </label>
+              <span class="muted small">Tối đa 10 tệp · 12 MB/tệp · Enter gửi · Shift+Enter xuống dòng</span>
               <button id="sendChat" class="button primary">Gửi tin nhắn →</button>
             </div>
           </div>
@@ -166,11 +178,20 @@
         </div>
         <span class="status"></span>
       </div>
-      <p class="job-prompt"></p>
+      <details class="job-prompt-details">
+        <summary class="job-prompt"></summary>
+        <p class="job-full-prompt"></p>
+      </details>
       <div class="job-message muted"></div>
       <div class="job-meta"></div>
-      <div class="videos"></div>
-      <div class="job-error"></div>
+      <details class="job-results hidden">
+        <summary class="job-results-summary"></summary>
+        <div class="videos"></div>
+      </details>
+      <details class="job-diagnostics hidden">
+        <summary>Chi tiết lỗi tải tệp</summary>
+        <pre class="job-error"></pre>
+      </details>
     </article>
   </template>
 
