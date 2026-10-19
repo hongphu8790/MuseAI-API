@@ -393,11 +393,15 @@ function renderJobs(jobs) {
 
     node.querySelector(".job-prompt").textContent = job.prompt;
     node.querySelector(".job-full-prompt").textContent = job.prompt;
+<<<<<<< HEAD
     node.querySelector(".job-message").textContent =
       job.error_code === "muse_finished_without_video"
         ? (job.message || "Muse không tạo video") +
           " — Phản hồi Muse: " + (job.muse_text || job.error || "Không có nội dung")
         : (job.message || "");
+=======
+    node.querySelector(".job-message").textContent = job.message || "";
+>>>>>>> 743877d6e8e07016bef0ceea11d09f910ac083dc
 
     const meta = node.querySelector(".job-meta");
     const entries = [
