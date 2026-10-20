@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .auth import MuseAuth
 from .client import MuseClient
+from .usage import fetch_usage
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -23,6 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("ping", help="Connect to Hatch and call /api/ping")
     sub.add_parser("model", help="Read the active Muse model")
+    sub.add_parser("usage", help="Show the plan's weekly usage (Settings > Usage)")
 
     history = sub.add_parser("history", help="Read recent chat history")
     history.add_argument("--session-id")
@@ -44,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--timeout", type=float, default=600)
     generate.add_argument("--min-videos", type=int, default=1)
     generate.add_argument("--no-download", action="store_true")
+    generate.add_argument("--no-usage", action="store_true", help="Do not print the weekly usage afterwards")
 
     upload = sub.add_parser("upload", help="Test the reverse-engineered fs.write upload")
     upload.add_argument("local_file")
@@ -65,6 +68,14 @@ async def run(args: argparse.Namespace) -> int:
         try:
             await auth.login_interactive(args.email, region=args.region)
             print(f"Login validated. Saved session in {auth.cookie_path}")
+            return 0
+        finally:
+            await auth.close()
+
+    if args.command == "usage":
+        auth = MuseAuth(state_dir=args.state_dir)
+        try:
+            print((await fetch_usage(auth)).summary())
             return 0
         finally:
             await auth.close()
@@ -110,6 +121,11 @@ async def run(args: argparse.Namespace) -> int:
                 print(f"downloaded: {path}")
             for error in result.download_errors:
                 print(f"download warning: {error}")
+            if not args.no_usage:
+                try:
+                    print((await fetch_usage(client.auth)).summary())
+                except Exception as exc:  # usage is informational; never fail a finished generation
+                    print(f"usage unavailable: {exc}")
         return 0
     finally:
         await client.close()

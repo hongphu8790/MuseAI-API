@@ -118,3 +118,19 @@ def test_media_extraction_merges_bare_label_with_sandbox_path():
     assert len(refs) == 1
     assert refs[0].path == f"sandbox://workspace/imagine_media/{name}"
     assert refs[0].url.startswith("https://")
+
+
+def test_subscription_usage_parsed_from_flight_rows():
+    from muse_ai.usage import parse_subscription_payload, usage_from_subscription
+
+    text = (
+        '0:{"a":"$@1","f":"","q":"","i":false}\n'
+        '1:{"success":true,"subscription":{"tier":{"tierId":"hatch_free","name":"Muse Free",'
+        '"tierCode":"HATCH_FREE"},"usage":{"state":"METERED","percentUsed":2,"resetsAt":1793026047,'
+        '"quotaStatus":"SUFFICIENT"},"topupRowValueLabel":"0% used (1B tokens left)"}}\n'
+    )
+    usage = usage_from_subscription(parse_subscription_payload(text))
+    assert (usage.plan, usage.tier_code, usage.percent_used, usage.quota_status) == (
+        "Muse Free", "HATCH_FREE", 2, "SUFFICIENT")
+    assert usage.resets_at is not None and usage.resets_at.year == 2026
+    assert "weekly used=2%" in usage.summary()

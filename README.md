@@ -119,6 +119,19 @@ The request sent to Muse contains a text item similar to:
 }
 ```
 
+## Weekly usage
+
+```bash
+muse-ai usage
+```
+
+prints the plan, the percent of the weekly allowance used, when it resets
+and the quota status (Settings > General > Usage in the web app).
+`muse-ai generate` prints the same line after every generation
+(`--no-usage` turns it off). The web app reads it through the Next.js server
+action `fetchSubscriptionAction`; if Meta changes that action, set
+`MUSE_SUBSCRIPTION_ACTION` to the new id.
+
 ## Image-to-Video
 
 Reference images are optional. Add one or more `--image` arguments when needed.
