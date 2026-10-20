@@ -96,3 +96,25 @@ def test_build_text_only_items():
     assert items == [
         {"type": "text", "text": "Create a cinematic 10-second video"}
     ]
+
+
+def test_media_extraction_merges_bare_label_with_sandbox_path():
+    # Muse lists one generated file as a bare label (resources[].label), a
+    # sandbox:// uri and a widget with a signed variants.original URL; a
+    # second, separate VideoRef for the bare label 404s on fs.raw.
+    name = "media-generation-demo-0-f1201613.mp4"
+    data = {
+        "chat_events": [
+            {"resources": [{"kind": "video", "label": name, "mime_type": "video/mp4",
+                            "uri": f"sandbox://workspace/imagine_media/{name}"}]},
+            {"payload": {"data": {"videos": [{
+                "label": "Demo", "mime": "video/mp4",
+                "path": f"sandbox://workspace/imagine_media/{name}",
+                "variants": {"original": f"https://vm.metaaivm.com/media/raw/workspace/imagine_media/{name}"},
+            }]}}},
+        ]
+    }
+    refs = extract_video_refs(data)
+    assert len(refs) == 1
+    assert refs[0].path == f"sandbox://workspace/imagine_media/{name}"
+    assert refs[0].url.startswith("https://")

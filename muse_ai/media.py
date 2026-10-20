@@ -56,6 +56,23 @@ def extract_session_ids(value: Any) -> list[str]:
     return found
 
 
+def _file_name(value: str | None) -> str | None:
+    """Last path component of a video path/URL (query and fragment dropped).
+    Muse reports one generated file both as a bare name and as a
+    sandbox:// path or signed URL; they must collapse to one VideoRef."""
+    if not value:
+        return None
+    clean = value.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    name = clean.rsplit("/", 1)[-1]
+    return name if _looks_video_path(name) else None
+
+
+def _aliases(ref: VideoRef) -> set[str]:
+    values = {v for v in (ref.path, ref.url, ref.resource_id, ref.media_handle) if v}
+    values |= {f"file:{n}" for n in (_file_name(ref.path), _file_name(ref.url)) if n}
+    return values
+
+
 def extract_video_refs(value: Any) -> list[VideoRef]:
     found: dict[str, VideoRef] = {}
 
@@ -63,25 +80,17 @@ def extract_video_refs(value: Any) -> list[VideoRef]:
         if not (ref.path or ref.url or ref.media_handle):
             return
 
-        aliases = {
-            value
-            for value in (ref.path, ref.url, ref.resource_id, ref.media_handle)
-            if value
-        }
+        aliases = _aliases(ref)
         for existing_key, existing in list(found.items()):
-            existing_aliases = {
-                value
-                for value in (
-                    existing.path,
-                    existing.url,
-                    existing.resource_id,
-                    existing.media_handle,
-                )
-                if value
-            }
-            if aliases & existing_aliases:
+            if aliases & _aliases(existing):
+                # prefer the reference that can actually be fetched: a URL /
+                # sandbox path over a bare file name
+                def pick(a: str | None, b: str | None) -> str | None:
+                    if a and b and "/" not in a and "/" in b:
+                        return b
+                    return a or b
                 merged = VideoRef(
-                    path=ref.path or existing.path,
+                    path=pick(ref.path, existing.path),
                     url=ref.url or existing.url,
                     mime_type=ref.mime_type or existing.mime_type,
                     resource_id=ref.resource_id or existing.resource_id,
