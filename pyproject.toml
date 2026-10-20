@@ -1,34 +1,33 @@
- 1 | [build-system]
- 2 | requires = ["setuptools>=69", "wheel"]
- 3 | build-backend = "setuptools.build_meta"
- 4 | 
- 5 | [project]
- 6 | name = "muse-ai-private-client"
- 7 | version = "0.2.0"
- 8 | description = "Reverse-engineered Python client for Muse.ai Hatch Noise RPC, based on an authorized browser capture."
- 9 | readme = "README.md"
-10 | requires-python = ">=3.11"
-11 | dependencies = [
-12 |   "cryptography>=42.0",
-13 |   "curl_cffi>=0.16.1",
-14 |   "httpx>=0.27",
-15 |   "Pillow>=10.0",
-16 |   "websockets>=13.0",
-17 | ]
-18 | 
-19 | [project.optional-dependencies]
-20 | dev = [
-21 |   "pytest>=8.0",
-22 |   "pytest-asyncio>=0.23",
-23 | ]
-24 | 
-25 | [project.scripts]
-26 | muse-ai = "muse_ai.cli:main"
-27 | 
-28 | [tool.setuptools.packages.find]
-29 | include = ["muse_ai*"]
-30 | 
-31 | [tool.pytest.ini_options]
-32 | asyncio_mode = "auto"
-33 | testpaths = ["tests"]
-34 | 
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "muse-ai-private-client"
+version = "0.2.0"
+description = "Reverse-engineered Python client for Muse.ai Hatch Noise RPC, based on an authorized browser capture."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "cryptography>=42.0",
+  "curl_cffi>=0.16.1",
+  "httpx>=0.27",
+  "Pillow>=10.0",
+  "websockets>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+muse-ai = "muse_ai.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["muse_ai*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
